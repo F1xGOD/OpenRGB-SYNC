@@ -1,33 +1,7 @@
-#!/usr/bin/env python3
-
-import argparse
-import asyncio
-import signal
-import sys
-from openrgb import OpenRGBClient
-from bleak import BleakClient
-
-# Default ELK-BLEDOM LED Strip Bluetooth details
-ELK_BLEDOM_MAC = "BE:67:00:1B:14:00"
-CHAR_UUID = "0000fff3-0000-1000-8000-00805f9b34fb"
-
-# Brightness conversion table (mapping 0-3 to 0-255)
-BRIGHTNESS_MAP = {0: 0, 1: 85, 2: 170, 3: 255}
-
-# Store last known keyboard status
-last_state = None
-running = True  # Flag for controlling loop
-
-def parse_arguments():
-    """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(description='Sync keyboard RGB and brightness with ELK-BLEDOM LED strip.')
-    parser.add_argument('-s', '--server', type=str, required=True, help='OpenRGB server IP address')
-    parser.add_argument('-p', '--port', type=int, default=6742, help='OpenRGB server port (default: 6742)')
-    parser.add_argument('-m', '--mac', type=str, default=ELK_BLEDOM_MAC, help='ELK-BLEDOM MAC address')
-    return parser.parse_args()
+import os
 
 async def get_keyboard_state(client):
-    """Retrieve the keyboard RGB color and brightness from OpenRGB."""
+    """Retrieve the keyboard RGB color from OpenRGB, and brightness from the system."""
     try:
         keyboard_device = next((device for device in client.devices if "Keyboard" in device.name), None)
 
@@ -39,9 +13,16 @@ async def get_keyboard_state(client):
 
         color = keyboard_device.colors[0]  # Get current RGB color
 
-        # Get brightness from the active mode
-        active_mode_id = keyboard_device.active_mode
-        brightness = keyboard_device.modes[active_mode_id].brightness
+        # Try to read brightness from the system (Linux only)
+        brightness = 3  # Default to max brightness
+        brightness_path = "/sys/class/leds/asus::kbd_backlight/brightness"
+
+        if os.path.exists(brightness_path):
+            try:
+                with open(brightness_path, "r") as f:
+                    brightness = int(f.read().strip())  # Read brightness value
+            except Exception as e:
+                print(f"\n⚠️ Failed to read system brightness: {e}")
 
         # Map brightness (0-3) to (0-1.0) scale for RGB dimming
         brightness_scale = BRIGHTNESS_MAP.get(brightness, 255) / 255.0
@@ -56,69 +37,3 @@ async def get_keyboard_state(client):
     except Exception as e:
         print(f"\n⚠️ Error retrieving keyboard state: {e}")
         return None
-
-async def set_led_state(r, g, b, brightness, mac_address):
-    """Send color and brightness settings to the ELK-BLEDOM LED strip using RGB dimming."""
-    try:
-        async with BleakClient(mac_address) as client:
-            if not client.is_connected:
-                print("\n⚠️ Failed to connect to ELK-BLEDOM!")
-                return
-
-            # Print in the same line (overwrite previous)
-            sys.stdout.write(f"\r✅ Updating ELK-BLEDOM: RGB({r}, {g}, {b}), Brightness {brightness}  ")
-            sys.stdout.flush()
-
-            # Set RGB (brightness is handled via dimming)
-            color_command = bytearray([0x7E, 0x00, 0x05, 0x03, r, g, b, 0x00, 0xEF])
-            await client.write_gatt_char(CHAR_UUID, color_command, response=False)
-
-    except Exception as e:
-        print(f"\n⚠️ Error updating ELK-BLEDOM: {e}")
-
-async def sync_state(server_ip, server_port, mac_address):
-    """Continuously sync keyboard color & brightness with the LED strip, only updating on change."""
-    global last_state, running
-
-    try:
-        client = OpenRGBClient(server_ip, port=server_port)  # Connect to OpenRGB server
-        print(f"✅ Connected to OpenRGB at {server_ip}:{server_port}")
-    except Exception as e:
-        print(f"\n❌ Failed to connect to OpenRGB server: {e}")
-        return
-
-    try:
-        while running:
-            state = await get_keyboard_state(client)
-
-            if state and state != last_state:  # Only update if the state changed
-                await set_led_state(*state, mac_address)
-                last_state = state  # Update last known state
-
-            await asyncio.sleep(0.05)  # Adjust refresh rate as needed
-    except asyncio.CancelledError:
-        print("\n🛑 Script interrupted. Cleaning up...")
-    finally:
-        print("\n🔌 Disconnecting from OpenRGB...")
-        client.disconnect()
-
-def signal_handler(sig, frame):
-    """Handle exit signals to stop the script gracefully."""
-    global running
-    running = False
-    print("\n🛑 Received exit signal (Ctrl+C). Stopping gracefully...")
-
-if __name__ == "__main__":
-    args = parse_arguments()
-
-    # Register the signal handler for graceful termination
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
-    # Run the sync loop
-    try:
-        asyncio.run(sync_state(args.server, args.port, args.mac))
-    except KeyboardInterrupt:
-        print("\n🛑 Exiting due to Ctrl+C.")
-    except Exception as e:
-        print(f"\n⚠️ Unexpected error: {e}")
